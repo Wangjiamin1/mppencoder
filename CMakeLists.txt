@@ -14,6 +14,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 message(STATUS "cmake version ${CMAKE_VERSION}")
 
+set(CMAKE_CXX_STANDARD 11)
+
 cmake_minimum_required (VERSION 2.8.8) # OBJECT libraries require 2.8.8
 include(CheckIncludeFiles)
 include(CheckFunctionExists)
@@ -51,10 +53,10 @@ include_directories(/usr/local/ffmpeg/include)
 
 
 
-link_directories(/home/rpdzkj/env/mpp/build/linux/aarch64/self_utils)
+# link_directories(/home/rpdzkj/env/mpp/build/linux/aarch64/self_utils)
 # link_directories(/home/rpdzkj/wjm/pinlingv2.3.1/pinlingv2.3/mppEncoder/build/utils)
 # link_directories(/home/rpdzkj/env/mpp/build/linux/aarch64/utils)
-link_directories(/usr/local/ffmpeg/lib)
+# link_directories(/usr/local/ffmpeg/lib)
 
 
 
@@ -86,6 +88,6 @@ find_package(ZLIB REQUIRED)
 
 
 
-add_executable(mpp_encoder src/main.cpp src/mpp_event_trigger.c src/mpp_parse_cfg.c src/mppEncoder.cpp)
-target_link_libraries(mpp_encoder ${MPP_SHARED} ${OpenCV_LIBS}  self_utils -lz -lavcodec -lavformat -lavutil -lswresample -lswscale -lswresample)
+add_executable(mpp_encoder src/main.cpp src/mpp_event_trigger.c src/mpp_parse_cfg.c src/mppEncoder.cpp ${SRC_FILES})
+target_link_libraries(mpp_encoder ${MPP_SHARED} ${OpenCV_LIBS} -lz -lavcodec -lavformat -lavutil -lswresample -lswscale -lswresample -lpthread)
 # target_link_libraries(mpp_encoder ${MPP_SHARED} ${OpenCV_LIBS} )

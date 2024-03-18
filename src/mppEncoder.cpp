@@ -20,6 +20,8 @@ CMppEncoder::CMppEncoder(int argc, char **argv)
 
     total_rate = 0;
     ret = MPP_NOK;
+    pkt = av_packet_alloc();
+    av_init_packet(pkt);
 }
 
 MPP_RET CMppEncoder::TestMppEncCfgSetup()
@@ -41,11 +43,11 @@ MPP_RET CMppEncoder::TestMppEncCfgSetup()
     if (p->fps_in_den == 0)
         p->fps_in_den = 1;
     if (p->fps_in_num == 0)
-        p->fps_in_num = 30;
+        p->fps_in_num = 60;
     if (p->fps_out_den == 0)
         p->fps_out_den = 1;
     if (p->fps_out_num == 0)
-        p->fps_out_num = 30;
+        p->fps_out_num = 60;
 
     if (!p->bps)
         p->bps = p->width * p->height / 8 * (p->fps_out_num / p->fps_out_den);
@@ -202,7 +204,7 @@ MPP_RET CMppEncoder::TestMppEncCfgSetup()
          * 40 / 41 / 42         - 1080p@30fps / 1080p@30fps / 1080p@60fps
          * 50 / 51 / 52         - 4K@30fps
          */
-        mpp_enc_cfg_set_s32(cfg, "h264:level", 40);
+        mpp_enc_cfg_set_s32(cfg, "h264:level", 42);
         mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", 1);
         mpp_enc_cfg_set_s32(cfg, "h264:cabac_idc", 0);
         mpp_enc_cfg_set_s32(cfg, "h264:trans8x8", 1);
@@ -308,12 +310,6 @@ MPP_RET CMppEncoder::TestMppEncCfgSetup()
     mpp_env_get_u32("osd_mode", &p->osd_mode, MPP_ENC_OSD_PLT_TYPE_DEFAULT);
     mpp_env_get_u32("roi_enable", &p->roi_enable, 0);
     mpp_env_get_u32("user_data_enable", &p->user_data_enable, 0);
-
-    if (p->roi_enable)
-    {
-        mpp_enc_roi_init(&p->roi_ctx, p->width, p->height, p->type, 4);
-        mpp_assert(p->roi_ctx);
-    }
 
 RET:
     return ret;
@@ -440,15 +436,88 @@ void CMppEncoder::Init()
             void *ptr = mpp_packet_get_pos(packet);
             size_t len = mpp_packet_get_length(packet);
 
+            sps_header.data = (uint8_t *)malloc(len);
+            sps_header.size = len;
+            memcpy(sps_header.data, ptr, len);
+            std::cout << len << std::endl;
+
             if (p->fp_output)
                 fwrite(ptr, 1, len, p->fp_output);
         }
 
         mpp_packet_deinit(&packet);
     }
+
+    init_rtmp_streamer("rtmp://localhost:1935/stream", sps_header.data, sps_header.size);
 }
 
-MPP_RET CMppEncoder::TestMppRun(cv::Mat img, MppPacketImpl &mpp_packet)
+int CMppEncoder::init_rtmp_streamer(char *stream, uint8_t *data, uint32_t size)
+{
+    int ret;
+    AVCodecParameters *in_codecpar;
+    if ((ret = avformat_network_init()) < 0)
+    {
+        fprintf(stderr, "avformat_network_init failed!");
+        return -1;
+    }
+
+    avformat_alloc_output_context2(&ofmt_ctx, NULL, "flv", stream);
+    if (!ofmt_ctx)
+    {
+        fprintf(stderr, "Could not create output context\n");
+        return -1;
+    }
+
+    out_stream = avformat_new_stream(ofmt_ctx, NULL);
+    if (!out_stream)
+    {
+        printf("Failed allocating output stream!\n");
+        goto end;
+    }
+
+    in_codecpar = out_stream->codecpar;
+    in_codecpar->codec_id = AV_CODEC_ID_H264;
+    in_codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    in_codecpar->codec_tag = 0;
+    in_codecpar->format = AV_PIX_FMT_BGR24;
+    in_codecpar->width = 1920;
+    in_codecpar->height = 1080;
+    in_codecpar->extradata = data;
+    in_codecpar->extradata_size = size;
+
+    av_dump_format(ofmt_ctx, 0, stream, 1);
+
+    // 打开输出URL（Open output URL）
+    if (!(ofmt_ctx->oformat->flags & AVFMT_NOFILE))
+    {
+        ret = avio_open(&ofmt_ctx->pb, stream, AVIO_FLAG_WRITE);
+        if (ret < 0)
+        {
+            printf("Could not open output URL '%s'", stream);
+            goto end;
+        }
+    }
+    // 写文件头（Write file header）
+    ret = avformat_write_header(ofmt_ctx, NULL);
+    if (ret < 0)
+    {
+        printf("Error occurred when opening output URL\n");
+        goto end;
+    }
+    // free(data);
+    return 0;
+end:
+    if (ofmt_ctx && !(ofmt_ctx->oformat->flags & AVFMT_NOFILE))
+        avio_close(ofmt_ctx->pb);
+    avformat_free_context(ofmt_ctx);
+    if (ret < 0 && ret != AVERROR_EOF)
+    {
+        printf("Error occurred.\n");
+        return -1;
+    }
+}
+
+MPP_RET CMppEncoder::TestMppRun(cv::Mat img)
 {
     MpiEncTestArgs *cmd = info->cmd;
     MpiEncTestData *p = &info->ctx;
@@ -495,98 +564,7 @@ MPP_RET CMppEncoder::TestMppRun(cv::Mat img, MppPacketImpl &mpp_packet)
     mpp_packet_init_with_buffer(&packet, p->pkt_buf);
     /* NOTE: It is important to clear output packet length!! */
     mpp_packet_set_length(packet, 0);
-    mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, packet);
-    mpp_meta_set_buffer(meta, KEY_MOTION_INFO, p->md_info);
 
-    if (p->osd_enable || p->user_data_enable || p->roi_enable)
-    {
-        if (p->user_data_enable)
-        {
-            MppEncUserData user_data;
-            char *str = "this is user data\n";
-
-            if ((p->frame_count & 10) == 0)
-            {
-                user_data.pdata = str;
-                user_data.len = strlen(str) + 1;
-                mpp_meta_set_ptr(meta, KEY_USER_DATA, &user_data);
-            }
-            static RK_U8 uuid_debug_info[16] = {
-                0x57, 0x68, 0x97, 0x80, 0xe7, 0x0c, 0x4b, 0x65,
-                0xa9, 0x06, 0xae, 0x29, 0x94, 0x11, 0xcd, 0x9a};
-
-            MppEncUserDataSet data_group;
-            MppEncUserDataFull datas[2];
-            char *str1 = "this is user data 1\n";
-            char *str2 = "this is user data 2\n";
-            data_group.count = 2;
-            datas[0].len = strlen(str1) + 1;
-            datas[0].pdata = str1;
-            datas[0].uuid = uuid_debug_info;
-
-            datas[1].len = strlen(str2) + 1;
-            datas[1].pdata = str2;
-            datas[1].uuid = uuid_debug_info;
-
-            data_group.datas = datas;
-
-            mpp_meta_set_ptr(meta, KEY_USER_DATAS, &data_group);
-        }
-
-        if (p->osd_enable)
-        {
-            /* gen and cfg osd plt */
-            mpi_enc_gen_osd_plt(&p->osd_plt, p->frame_count);
-
-            p->osd_plt_cfg.change = MPP_ENC_OSD_PLT_CFG_CHANGE_ALL;
-            p->osd_plt_cfg.type = MPP_ENC_OSD_PLT_TYPE_USERDEF;
-            p->osd_plt_cfg.plt = &p->osd_plt;
-
-            ret = mpi->control(ctx, MPP_ENC_SET_OSD_PLT_CFG, &p->osd_plt_cfg);
-            if (ret)
-            {
-                mpp_err("mpi control enc set osd plt failed ret %d\n", ret);
-                goto RET;
-            }
-
-            /* gen and cfg osd plt */
-            mpi_enc_gen_osd_data(&p->osd_data, p->buf_grp, p->width,
-                                 p->height, p->frame_count);
-            mpp_meta_set_ptr(meta, KEY_OSD_DATA, (void *)&p->osd_data);
-        }
-
-        if (p->roi_enable)
-        {
-            RoiRegionCfg *region = &p->roi_region;
-
-            /* calculated in pixels */
-            region->x = MPP_ALIGN(p->width / 8, 16);
-            region->y = MPP_ALIGN(p->height / 8, 16);
-            region->w = 128;
-            region->h = 256;
-            region->force_intra = 0;
-            region->qp_mode = 1;
-            region->qp_val = 24;
-
-            mpp_enc_roi_add_region(p->roi_ctx, region);
-
-            region->x = MPP_ALIGN(p->width / 2, 16);
-            region->y = MPP_ALIGN(p->height / 4, 16);
-            region->w = 256;
-            region->h = 128;
-            region->force_intra = 1;
-            region->qp_mode = 1;
-            region->qp_val = 10;
-
-            mpp_enc_roi_add_region(p->roi_ctx, region);
-
-            /* send roi info by metadata */
-            mpp_enc_roi_setup_meta(p->roi_ctx, meta);
-        }
-    }
-
-    if (!p->first_frm)
-        p->first_frm = mpp_time();
     /*
      * NOTE: in non-block mode the frame can be resent.
      * The default input timeout mode is block.
@@ -624,63 +602,14 @@ MPP_RET CMppEncoder::TestMppRun(cv::Mat img, MppPacketImpl &mpp_packet)
             RK_S32 log_size = sizeof(log_buf) - 1;
             RK_S32 log_len = 0;
 
-            if (!p->first_pkt)
-                p->first_pkt = mpp_time();
-
             p->pkt_eos = mpp_packet_get_eos(packet);
 
-            // memcpy(&mpp_packet, ptr, len);
-
-            if (p->fp_output)
-                fwrite(ptr, 1, len, p->fp_output);
-
-            if (p->fp_verify && !p->pkt_eos)
-            {
-                calc_data_crc((RK_U8 *)ptr, (RK_U32)len, &checkcrc);
-                mpp_log("p->frame_count=%d, len=%d\n", p->frame_count, len);
-                write_data_crc(p->fp_verify, &checkcrc);
-            }
-
-            log_len += snprintf(log_buf + log_len, log_size - log_len,
-                                "encoded frame %-4d", p->frame_count);
-
-            /* for low delay partition encoding */
-            if (mpp_packet_is_partition(packet))
-            {
-                eoi = mpp_packet_is_eoi(packet);
-
-                log_len += snprintf(log_buf + log_len, log_size - log_len,
-                                    " pkt %d", p->frm_pkt_cnt);
-                p->frm_pkt_cnt = (eoi) ? (0) : (p->frm_pkt_cnt + 1);
-            }
-
-            log_len += snprintf(log_buf + log_len, log_size - log_len,
-                                " size %-7zu", len);
-
-            if (mpp_packet_has_meta(packet))
-            {
-                meta = mpp_packet_get_meta(packet);
-                RK_S32 temporal_id = 0;
-                RK_S32 lt_idx = -1;
-                RK_S32 avg_qp = -1;
-
-                if (MPP_OK == mpp_meta_get_s32(meta, KEY_TEMPORAL_ID, &temporal_id))
-                    log_len += snprintf(log_buf + log_len, log_size - log_len,
-                                        " tid %d", temporal_id);
-
-                if (MPP_OK == mpp_meta_get_s32(meta, KEY_LONG_REF_IDX, &lt_idx))
-                    log_len += snprintf(log_buf + log_len, log_size - log_len,
-                                        " lt %d", lt_idx);
-
-                if (MPP_OK == mpp_meta_get_s32(meta, KEY_ENC_AVERAGE_QP, &avg_qp))
-                    log_len += snprintf(log_buf + log_len, log_size - log_len,
-                                        " qp %d", avg_qp);
-            }
+            write_frame((uint8_t *)ptr, len, (MppPacketImpl *)packet);
 
             mpp_log_q(quiet, "chn %d %s\n", chn, log_buf);
 
             mpp_packet_deinit(&packet);
-            fps_calc_inc(cmd->fps);
+            // fps_calc_inc(cmd->fps);
 
             p->stream_size += len;
             p->frame_count += eoi;
@@ -695,6 +624,61 @@ MPP_RET CMppEncoder::TestMppRun(cv::Mat img, MppPacketImpl &mpp_packet)
 RET:
 
     return ret;
+}
+
+bool CMppEncoder::writeHeader(MpiEncTestData *mpp_enc_data, SpsHeader *sps_header)
+{
+    int ret;
+    if (mpp_enc_data->type == MPP_VIDEO_CodingAVC)
+    {
+        MppPacket packet = NULL;
+        ret = mpp_enc_data->mpi->control(mpp_enc_data->ctx, MPP_ENC_GET_EXTRA_INFO, &packet);
+        if (ret)
+        {
+            printf("mpi control enc get extra info failed\n");
+            return 1;
+        }
+
+        /* get and write sps/pps for H.264 */
+        if (packet)
+        {
+            void *ptr = mpp_packet_get_pos(packet);
+            size_t len = mpp_packet_get_length(packet);
+            sps_header->data = (uint8_t *)malloc(len);
+            sps_header->size = len;
+            memcpy(sps_header->data, ptr, len);
+            packet = NULL;
+        }
+    }
+    return 1;
+}
+
+int CMppEncoder::write_frame(uint8_t *data, int size, MppPacketImpl *mpp_pkt)
+{
+    pkt->size = size;
+    pkt->data = data;
+    pkt->flags = 0x01;
+    pkt->stream_index = out_stream->index;
+    // std::cout << size << std::endl;
+    pkt->duration = AV_TIME_BASE * 1 / 60000;
+    pkt->dts = frame_index * pkt->duration;
+    pkt->pts = pkt->dts;
+    frame_index++;
+    printf("%d\n", frame_index);
+    // pkt->dts = mpp_pkt->dts;
+    // pkt->pts = mpp_pkt->pts;
+
+    if (av_write_frame(ofmt_ctx, pkt) < 0)
+    {
+        printf("Error muxing packet\n");
+        return -1;
+    }
+    // if (av_interleaved_write_frame(ofmt_ctx, pkt) < 0)
+    // {
+    //     printf("Error muxing packet\n");
+    //     return -1;
+    // }
+    return 0;
 }
 
 MPP_RET CMppEncoder::TestCtxInit()

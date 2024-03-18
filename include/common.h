@@ -127,4 +127,10 @@ typedef struct
     MpiEncMultiCtxRet ret; // return of encoder
 } MpiEncMultiCtxInfo;
 
+typedef struct
+{
+    uint8_t *data;
+    uint32_t size;
+} SpsHeader;
+
 #endif
